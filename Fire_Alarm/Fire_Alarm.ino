@@ -62,10 +62,11 @@ int coReadings[numReadings] = {0};
 int index_gas = 0;
 
 QueueHandle_t sensorDataQueue;
-QueueHandle_t mqttQueue; // Cola para controlar el procesamiento MQTT
 
 volatile bool alarmTriggered = false;
 volatile bool dataReady = false;
+volatile bool environmentalAlarm = false; // Estado de la alarma por condiciones ambientales
+volatile bool remoteAlarm = true;        // Estado de la alarma solicitado remotamente
 
 // Variables para histórico de datos
 float tempHistory[HISTORY_SIZE] = {0};
@@ -97,8 +98,11 @@ byte Alert0[8] = {0b00001, 0b00010, 0b00101, 0b00101, 0b01000, 0b10001, 0b10000,
 byte Alert1[8] = {0b00000, 0b10000, 0b01000, 0b01000, 0b00100, 0b00010, 0b00010, 0b11100};
 
 void IRAM_ATTR triggerAlarm() {
+environmentalAlarm = true;
+    if (remoteAlarm) {
     alarmTriggered = true;
     publishAlert("Alerta Activada");
+}
 }
 
 // Publicar datos vía MQTT
@@ -138,10 +142,26 @@ void callback(char* topic, byte* payload, unsigned int length) {
 
   if (String(topic) == topic_control) {
     int controlValue = message.toInt();
-    if (xQueueSend(mqttQueue, &controlValue, portMAX_DELAY) != pdPASS) {
-      Serial.println("Error: No se pudo enviar el mensaje a la cola MQTT.");
+    if (controlValue == 0) {
+remoteAlarm = false;
+      alarmTriggered = false;
+      alarmActive = false;
+      digitalWrite(LED_PIN, LOW);
+      noTone(BUZZER_PIN);
+      addNotification("Alarma desactivada remotamente");
+      Serial.println("Alarma desactivada remotamente");
+    } else if (controlValue == 1) {
+remoteAlarm = true;
+      if (environmentalAlarm) {
+      alarmTriggered = true;
+      alarmActive = true;
+      tone(BUZZER_PIN, 1000);
+      digitalWrite(LED_PIN, HIGH);
+      addNotification("Alarma activada remotamente");
+      Serial.println("Alarma activada remotamente");
     }
   }
+}
 }
 
 // Reconectar al broker MQTT
@@ -171,30 +191,6 @@ void readSensorsTask(void *pvParameters) {
     xQueueSend(sensorDataQueue, &sensorData, portMAX_DELAY);
     dataReady = true;
     vTaskDelay(500 / portTICK_PERIOD_MS); // Leer sensores cada 500ms
-  }
-}
-
-// Tarea para procesar mensajes MQTT
-void mqttTask(void *pvParameters) {
-  int controlValue;
-  while (true) {
-    if (xQueueReceive(mqttQueue, &controlValue, portMAX_DELAY) == pdTRUE) {
-      if (controlValue == 0) {
-        alarmTriggered = false;
-        alarmActive = false;
-        digitalWrite(LED_PIN, LOW);
-        noTone(BUZZER_PIN);
-        addNotification("Alarma desactivada remotamente");
-        Serial.println("Alarma desactivada remotamente");
-      } else if (controlValue == 1) {
-        alarmTriggered = true;
-        alarmActive = true;
-        tone(BUZZER_PIN, 1000);
-        digitalWrite(LED_PIN, HIGH);
-        addNotification("Alarma activada remotamente");
-        Serial.println("Alarma activada remotamente");
-      }
-    }
   }
 }
 
@@ -289,9 +285,9 @@ void setRGB(int red, int green, int blue) {
 }
 
 // Bucle principal del programa
-void myLoopTask( void *pvParameters) {
+void myLoopTask(void *pvParameters) {
   SensorData receivedData;
-  while(true){
+  while (true) {
     server.handleClient();
 
     if (xQueueReceive(sensorDataQueue, &receivedData, portMAX_DELAY) == pdTRUE) {
@@ -342,9 +338,7 @@ void myLoopTask( void *pvParameters) {
       bool highCO = sensorData.co > 30;
       bool rapidChange = (tempDiff > 2) || (humiDiff < -5) || (coDiff > 5);
 
-      String status = "Monitoreo OK";
-      if (highTemp) {
-        status = "Temp alta";
+     if (highTemp) {
         lcd.clear();
         lcd.setCursor(0, 0);
         lcd.print("Monitoreo OK");
@@ -358,7 +352,6 @@ void myLoopTask( void *pvParameters) {
         setRGB(255, 0, 0);
         lcd.clear();
       } else if (lowTemp) {
-        status = "Temp baja";
         lcd.clear();
         lcd.setCursor(0, 0);
         lcd.print("Monitoreo OK");
@@ -372,7 +365,6 @@ void myLoopTask( void *pvParameters) {
         setRGB(255, 0, 0);
         lcd.clear();  
       } else if (lowHumi) {
-        status = "Humedad Baja";
         digitalWrite(LED_PIN, HIGH);
         lcd.clear();
         lcd.setCursor(0, 0);
@@ -387,28 +379,25 @@ void myLoopTask( void *pvParameters) {
       } else {
         setRGB(0, 255, 0);
         digitalWrite(LED_PIN, LOW);
-      }
+      }  (highTemp && lowHumi) || (rapidChange && highCO);
 
-      // Activar alarma si se detectan condiciones de incendio
-      if (fireDetected || (highTemp && lowHumi) || (rapidChange && highCO)) {
-        triggerAlarm();
-      }
-
-      // Manejar la activación de la alarma
-      if (alarmTriggered && !alarmActive) {
+      String status = "Monitoreo OK";
+      if (environmentalAlarm && remoteAlarm && !alarmActive) {
         alarmActive = true;
+        status = "ALERTA INCENDIO";
         addNotification("¡ALARMA DE INCENDIO ACTIVADA!");
         tone(BUZZER_PIN, 1000);
         digitalWrite(LED_PIN, HIGH);
         lcd.clear();
         lcd.setCursor(0, 0);
         lcd.print("Alerta incendio!!");
-        lcd.setCursor(0, 1);
-        delay(1000);
+                delay(1000);
       }
 
-      if (alarmActive) {
-        status = "ALERTA INCENDIO!";
+      if (!environmentalAlarm || !remoteAlarm) {
+        alarmActive = false;
+        digitalWrite(LED_PIN, LOW);
+        noTone(BUZZER_PIN);
       }
 
       // Actualizar el historial de datos
@@ -419,7 +408,7 @@ void myLoopTask( void *pvParameters) {
 
       publishData(receivedData, status);
     }
-    vTaskDelay(100/ portTICK_PERIOD_MS);
+    vTaskDelay(100 / portTICK_PERIOD_MS);
   }
 }
 
@@ -436,12 +425,7 @@ void setup() {
 
   sensorDataQueue = xQueueCreate(5, sizeof(SensorData));
   if (sensorDataQueue == NULL) {
-    Serial.println("Error al crear la cola de datos de sensores.");
-  }
-
-  mqttQueue = xQueueCreate(5, sizeof(int)); // Crear la cola para mensajes MQTT
-  if (mqttQueue == NULL) {
-    Serial.println("Error al crear la cola MQTT.");
+  Serial.println("Error al crear la cola.");
   }
 
   MQ2.setRegressionMethod(1);
@@ -460,7 +444,7 @@ void setup() {
 
   Serial.print("Calibrating MQ2...");
   float calcR0 = 0;
-  for (int i = 1; i <= 10; i++) {
+  for(int i = 1; i <= 10; i++) {
     MQ2.update();
     calcR0 += MQ2.calibrate(RatioMQ2CleanAir);
     Serial.print(".");
@@ -516,11 +500,11 @@ void setup() {
 
   // Crear tarea para leer sensores
   xTaskCreate(readSensorsTask, "ReadSensorsTask", 2048, NULL, 1, NULL);
-
-  // Crear tarea para procesar mensajes MQTT
-  xTaskCreate(mqttTask, "MQTTTask", 4096, NULL, 1, NULL);
+  xTaskCreate(myLoopTask, "LoopTask", 4096, NULL, 1, NULL);
 }
-
 void loop() {
+  if (!client.connected()) {
+    reconnect();
+  }
   client.loop(); // Procesar mensajes MQTT
 }
